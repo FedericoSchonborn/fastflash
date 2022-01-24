@@ -1,4 +1,4 @@
-module github.com/fdschonborn/autofastboot
+module github.com/fdschonborn/fastflash
 
 go 1.17
 
