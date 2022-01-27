@@ -2,8 +2,10 @@ package main
 
 import (
 	"crypto/md5"
+	"encoding/hex"
 	"encoding/xml"
 	"errors"
+	"flag"
 	"fmt"
 	"io"
 	"os"
@@ -14,26 +16,41 @@ import (
 	"github.com/fatih/color"
 )
 
-var boldGreen = color.New(color.Bold, color.FgGreen).SprintFunc()
+var boldGreen = color.New(color.Bold, color.FgGreen).SprintfFunc()
+
+var (
+	fastbootPath = flag.String("f", "fastboot", "Path to the fastboot executable")
+	firmwareDir  = flag.String("D", "", "Path to firmware files")
+	skipCheck    = flag.Bool("C", false, "Skip file checksum checks")
+	dryRun       = flag.Bool("d", false, "Do not run any commands")
+)
 
 func main() {
-	if err := run(os.Args); err != nil {
+	if err := run(); err != nil {
 		fmt.Printf("Error: %s\n", err)
 		for {
 			err = errors.Unwrap(err)
-			if err != nil {
-				fmt.Printf("Caused by: %s\n", err)
-				continue
+			if err == nil {
+				break
 			}
 
-			break
+			fmt.Printf("       Caused by: %s\n", err)
 		}
 	}
 }
 
-func run(args []string) error {
-	path := args[1]
-	dir := filepath.Dir(path)
+func run() error {
+	flag.Parse()
+
+	path := flag.Arg(0)
+	if path == "" {
+		return errors.New("path to flash file not provided")
+	}
+
+	dir := *firmwareDir
+	if dir == "" {
+		dir = filepath.Dir(path)
+	}
 
 	file, err := os.Open(path)
 	if err != nil {
@@ -45,7 +62,12 @@ func run(args []string) error {
 		return err
 	}
 
-	var cmds []*exec.Cmd
+	type Command struct {
+		Step    *Step
+		Command *exec.Cmd
+	}
+
+	var cmds []Command
 	for _, step := range f.Steps {
 		var args []string
 		if step.Operation != "" {
@@ -58,39 +80,57 @@ func run(args []string) error {
 			args = append(args, step.Partition)
 		}
 		if step.Filename != "" {
-			if step.MD5 != "" {
-				fmt.Printf("    %s %s\n", boldGreen("Verifying"), step.Filename)
+			if !*skipCheck {
+				if step.MD5 != "" {
+					fmt.Printf(boldGreen("%15s", "Verifying")+" %s\n", step.Filename)
 
-				hash := md5.New()
-				file, err := os.Open(filepath.Join(dir, step.Filename))
-				if err != nil {
-					return err
-				}
+					hash := md5.New()
+					file, err := os.Open(filepath.Join(dir, step.Filename))
+					if err != nil {
+						return err
+					}
 
-				if _, err := io.Copy(hash, file); err != nil {
-					return err
-				}
+					if _, err := io.Copy(hash, file); err != nil {
+						return err
+					}
 
-				md5sum := fmt.Sprintf("%x", hash.Sum(nil))
-				if md5sum != step.MD5 {
-					return errors.New("checksum failure, file may be corrupted")
+					md5sum := hex.EncodeToString(hash.Sum(nil))
+					if md5sum != step.MD5 {
+						return errors.New("checksum failure, file may be corrupted")
+					}
 				}
 			}
 
 			args = append(args, step.Filename)
 		}
 
-		cmd := exec.Command("fastboot", args...)
+		cmd := exec.Command(*fastbootPath, args...)
 		cmd.Stderr = os.Stderr
 		cmd.Stdin = os.Stdin
 		cmd.Stdout = os.Stdout
-		cmds = append(cmds, cmd)
+		cmds = append(cmds, Command{step, cmd})
 	}
 
 	for _, cmd := range cmds {
-		fmt.Printf("      %s %s\n", boldGreen("Running"), strings.Join(cmd.Args[1:], " "))
-		if err := cmd.Run(); err != nil {
-			return err
+		var action string
+		var args string
+		switch cmd.Step.Operation {
+		case "flash":
+			action = " Flashing"
+			args = fmt.Sprintf("%-10s (%s)", cmd.Step.Partition, cmd.Step.Filename)
+		case "erase":
+			action = "  Erasing"
+			args = cmd.Step.Partition
+		default:
+			action = "  Running"
+			args = strings.Join(cmd.Command.Args[1:], " ")
+		}
+
+		fmt.Printf(boldGreen("%15s", action)+" %s\n", args)
+		if !*dryRun {
+			if err := cmd.Command.Run(); err != nil {
+				return err
+			}
 		}
 	}
 
